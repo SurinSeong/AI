@@ -22,7 +22,7 @@
     - 하지만, Cursor AI를 몸으로 하고 MCP를 팔, 다리로 해서 **코딩할 수 없는 사람도 사용**할 수 있도록 했음.
         - = 호환성이 좋음.
     - 사용자가 많은 Cursor AI가 Integrate함으로써 많은 사람의 관심을 받음.
-    - 앱스토어( https://smithery.ai/)에 사용할 수 있는 tool들이 계속해서 늘어나게 되며 선순환이 된다.
+    - 앱스토어[smithery](https://smithery.ai/) 에 사용할 수 있는 tool들이 계속해서 늘어나게 되며 선순환이 된다.
     - 곧 openAI도 사용할 수 있도록 할 것 같음..
     - langchain에서도 **mcp를 지원**하는 프로젝트를 많이 내고 있음.
 
@@ -44,6 +44,6 @@
 4. Python Function
     - custom logic 생성 → 호출
 
-Langchain & LangGraph
+### Langchain & LangGraph
 
 [langgraph-mcp-agents](https://github.com/teddynote-lab/langgraph-mcp-agents/)
