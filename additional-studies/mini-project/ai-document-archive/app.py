@@ -6,6 +6,7 @@ from transformers import (
     AutoTokenizer, AutoModelForSeq2SeqLM,
     VisionEncoderDecoderModel, LayoutLMv3Processor, LayoutLMv3ForTokenClassification,
 )
+from konlpy.tag import Okt, Komoran
 from paddleocr import PaddleOCR
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 from datetime import datetime
@@ -36,6 +37,8 @@ class Document(SQLModel, table=True):
 # 데이터베이스 초기화
 engine = create_engine("sqlite:///archive.db")
 SQLModel.metadata.create_all(engine)
+
+komoran = Komoran()
 
 # 모델 로드
 @st.cache_resource
@@ -138,6 +141,7 @@ def enhance_text_regions(binary, dilation_iter):
     final_image = cv2.dilate(binary, kernel, iterations=dilation_iter)
     return final_image
 
+
 # OCR 성능 향상을 위한 이미지 전처리
 def preprocess_image_for_ocr(image, blur_size, block_size, C_value, dilation_iter):
     """OCR 성능 향상을 위한 이미지 전처리"""
@@ -193,6 +197,7 @@ def extract_text_with_layout(image, blur_size, block_size, C_value, dilation_ite
     
     return text, boxes
 
+#---------------------------------------------------------------------------------
 
 # LayoutLMv3를 활용한 구조화된 정보 추출 함수
 def extract_structured_with_layoutlm(image, text, boxes, layout_processor, layout_model, doc_type):
@@ -517,14 +522,87 @@ def create_embedding(text, model):
     embedding = model.encode(text)
     return embedding.tolist()
 
-# 키워드 추출
+# 형태소 분석 및 품사 태깅하기
+def morpheme_analyze(text):
+    pos_tagged = komoran.pos(text)
+    return pos_tagged
+    
+# 명사만 추출하는 함수
+def extract_nouns_from_pos(pos_tagged):
+    nouns = [word for word, tag in pos_tagged if tag == "Noun" and len(word) > 1]
+    return list(set(nouns))
+
+# 불용어 필터링 함수
+def filter_stopwords(nouns, stopwords=None):
+    if stopwords is None:
+        stopwords = ['은', '는', '이', '가', '을', '를', '의', '에', '와', '과', '에서', '으로']
+
+    filtered = [word for word in nouns if word not in stopwords]
+    return filtered
+
+# 복합 명사 생성
+def create_compound_nouns(pos_tagged):
+
+    compound_nouns = []
+    temp = []
+
+    # 태깅된 단어들을 순회한다.
+    for word, tag in pos_tagged:
+        if tag in ["NNG", "NNP"]:    # 일반 명사, 고유 명사
+            temp.append(word)
+
+        # 명사 태그가 없다면
+        else:
+            if len(temp) > 1:
+                compound_nouns.append(''.join(temp))
+            temp = []
+
+    if len(temp) > 1:
+        compound_nouns.append(''.join(temp))
+
+    return compound_nouns
+
+# TF-IDF 점수 계산하기
+def calculate_tfidf_scores(filtered_nouns):
+    
+    return word_scores
+
+# 형태소 분석을 통한 키워드 추출
+def extract_keywords_with_morpheme_analysis(text, top_k=15):
+    """형태소 분석을 통한 키워드 추출"""
+    # 1. 형태소 분석 및 품사 태깅
+    pos_tagged = morpheme_analyze(text)
+
+    # 2. 명사만 추출 (일반 명사, 고유 명사)
+    nouns = extract_nouns_from_pos(pos_tagged)
+
+    # 불용어 필터링
+    filtered_nouns = filter_stopwords(nouns)
+
+    # 3. 복합 명사 생성
+    compound_nouns = create_compound_nouns(pos_tagged)
+
+    # 복합 명사 + 일반 명사 + 고유 명사
+    filtered_nouns.extend(compound_nouns)
+
+    # 4. TF-IDF 점수 계산
+    word_scores = calculate_tfidf_scores(filtered_nouns)
+
+    # 5. 점수 기준 상위 키워드 선택
+    top_keywords = select_top_keywords(word_scores, top_k)
+
+    return top_keywords
+
+# 기존 함수 대체하기
 def extract_keywords(text, structured_data=None):
-    stopwords = ['은', '는', '이', '가', '을', '를', '의', '에', '와', '과', '에서', '으로']
-    words = text.split()
-    keywords = [w for w in words if len(w) > 1 and w not in stopwords]
+    """개선된 키워드 추출 함수"""
+    # 형태소 분석 기반 키워드 추출
+    keywords = extract_keywords_with_morpheme_analysis(text)
     
     # 구조화된 데이터에서 추가 키워드
     if structured_data:
+        keywords.extend(extract_structured_keywords(structured_data))
+
         if 'store' in structured_data:
             keywords.append(structured_data['store'])
         if 'date' in structured_data:
@@ -705,7 +783,7 @@ with tab1:
                 }
         
     prev_results = st.session_state.get("prev_doc_results")
-    
+
     # 처리 완료된 결과 표시
     if uploaded_file is not None and st.session_state.doc_results is not None:
         results = st.session_state.doc_results
