@@ -101,49 +101,60 @@ def convert_to_grayscale(image):
     return gray_image
 
 # 노이즈 제거하기
-def remove_noise(gray_image):
-    # 가우시안 블러 사용
-    denoised = cv2.GaussianBlur(gray_image, (5, 5), 0)
+def remove_noise(gray_image, blur_size):
+    # 가우시안 블러 사용 => 커널의 크기가 클수록 더 부드럽게 된다. 하지만 너무 크면 뭉개짐.
+    # 얇은 글자일 경우 -> 작게 / 잉크 번짐과 같은 노이즈가 많을 경우 -> 조금 더 크게
+    denoised = cv2.GaussianBlur(gray_image, (blur_size, blur_size), 0)
     return denoised
 
 # 대비 개선하기
 def improve_contrast(denoised):
-    enhanced = cv2.equalizeHist(denoised)
+    # 전체적인 대비 향상 -> 조명에 따라 부자연스러울 수 있음.
+    # enhanced = cv2.equalizeHist(denoised)
+    # 더 좋은 대안 : CLAHE (적응적 히스토그램 평활화)
+    # clipLimit가 낮을수록 부드럽고, 높을수록 대비가 강조된다.
+    # tileGridSize는 글자 크기 기준 보통 (8, 8), 글자가 작으면 (4, 4)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(denoised) 
     return enhanced
 
 # 이진화
-def apply_adaptive_binarization(enhanced):
+def apply_adaptive_binarization(enhanced, block_size, C_value):
     binary = cv2.adaptiveThreshold(
         enhanced, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2. THRESH_BINARY,
-        11, 2
+        block_size,     # 주변 블록 크기. 글자 크기보다 조금 큰 값이 좋음.
+        C_value       # 빼는 상수. 어두운 배경일수록 조금 더 크게 조절 가능.
     )
     return binary
 
 # 텍스트 영역 강화
-def enhance_text_regions(binary):
+def enhance_text_regions(binary, dilation_iter):
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    final_image = cv2.dilate(binary, kernel, iterations=1)
+    # 텍스트 굵게 해서 OCR이 잘 되도록 할 수 있다.
+    # 얇은 글씨 : iterations=1
+    # 끊긴 글씨나 번진 잉크는 (3, 3)보다 큰 커널로 iterations=2~3도 실험해볼만하다.
+    final_image = cv2.dilate(binary, kernel, iterations=dilation_iter)
     return final_image
 
 # OCR 성능 향상을 위한 이미지 전처리
-def preprocess_image_for_ocr(image):
+def preprocess_image_for_ocr(image, blur_size, block_size, C_value, dilation_iter):
     """OCR 성능 향상을 위한 이미지 전처리"""
     # 1. 그레이 스케일 변화
     gray_image = convert_to_grayscale(image)
 
     # 2. 노이즈 제거
-    denoised = remove_noise(gray_image)
+    denoised = remove_noise(gray_image, blur_size)
 
     # 3. 대비 개선
     enhanced = improve_contrast(denoised)
 
     # 4. 이진화 (텍스트와 배경 분리)
-    binary = apply_adaptive_binarization(enhanced)
+    binary = apply_adaptive_binarization(enhanced, block_size, C_value)
 
     # 5. 텍스트 영역 강화
-    final_image = enhance_text_regions(binary)
+    final_image = enhance_text_regions(binary, dilation_iter)
 
     return final_image
 
@@ -168,11 +179,11 @@ def extract_text_and_positions(result):
     
 
 # 기존 OCR 함수에 전처리 옵션 추가하기
-def extract_text_with_layout(image, use_preprocessing=True):
+def extract_text_with_layout(image, blur_size, block_size, C_value, dilation_iter, use_preprocessing=True):
     """전처리 옵션이 추가된 OCR 함수"""
     # 전처리 적용 여부 확인하기
     if use_preprocessing:
-        image = preprocess_image_for_ocr(image)
+        image = preprocess_image_for_ocr(image, blur_size, block_size, C_value, dilation_iter)
 
     # OCR 수행하기
     result = perform_ocr(image)
@@ -522,7 +533,7 @@ def extract_keywords(text, structured_data=None):
     return ", ".join(list(set(keywords)))
 
 # 문서 처리
-def process_document(uploaded_file, models):
+def process_document(uploaded_file, models, blur_size, block_size, C_value, dilation_iter):
     (dit_processor, dit_model, ocr, donut_processor, donut_model, 
      layout_processor, layout_model, sum_tokenizer, sum_model,
      embedding_model) = models
@@ -533,7 +544,7 @@ def process_document(uploaded_file, models):
     doc_type = classify_document(image, dit_processor, dit_model)
     print('\n==========')
     print(f'\n[doc_type]\n{doc_type}')
-    content, boxes = extract_text_with_layout(image, ocr)
+    content, boxes = extract_text_with_layout(image, blur_size, block_size, C_value, dilation_iter)
     layoutlm_data = extract_structured_with_layoutlm(image, content, boxes, layout_processor, layout_model, doc_type)
     print('\n==========')
     print(f'\n[layoutlm_data]\n{layoutlm_data}')
@@ -650,32 +661,57 @@ if 'doc_results' not in st.session_state:
 with tab1:
     uploaded_file = st.file_uploader("문서를 업로드하세요", type=['png', 'jpg', 'jpeg'])
 
-    # 새 파일인지 확인
+    # 새 파일이면 세션 초기화 하기 + 이전 결과 백업하기
     if uploaded_file is not None and uploaded_file != st.session_state.processed_file:
+        # 이전 결과 백업
+        if st.session_state.doc_results:
+            st.session_state.prev_doc_results = st.session_state.doc_results.copy()
+
         st.session_state.processed_file = uploaded_file
         st.session_state.processing_complete = False
-    
-    # 처리되지 않은 파일만 처리
-    if uploaded_file is not None and not st.session_state.processing_complete:
-        with st.spinner("문서 처리 중..."):
-            doc_type, content, summary, keywords, structured_data, img_data, embedding = process_document(
-                uploaded_file, models
-            )
-            st.session_state.processing_complete = True
-            # 결과를 세션에 저장
-            st.session_state.doc_results = {
-                'doc_type': doc_type,
-                'content': content,
-                'summary': summary,
-                'keywords': keywords,
-                'structured_data': structured_data,
-                'img_data': img_data,
-                'embedding': embedding
-            }
+        st.session_state.ocr_ready = False    # OCR은 버튼 누를 때만 진행한다.
+
+    # 파일이 업로드 되었다면
+    if uploaded_file:
+        st.subheader("🔧 전처리 설정")
+
+        blur_size = st.slider("가우시안 블러 커널 크기", 1, 11, 5, step=2)
+        block_size = st.slider("Adaptive Threshold blockSize", 3, 25, 11, step=2)
+        C_value = st.slider("Threshold 상수 C", 0, 10, 2)
+        dilation_iter = st.slider("Dilation 반복 횟수", 0, 3, 1)
+
+        # 전처리 미리보기
+        pil_image = Image.open(uploaded_file).convert("RGB")
+        final_image = preprocess_image_for_ocr(pil_image, blur_size, block_size, C_value, dilation_iter)
+
+        st.image(final_image, caption="전처리 결과", channels="GRAY")
+
+        if st.button("🔠 OCR 시작"):
+            with st.spinner("OCR 분석 중..."):
+                doc_type, content, summary, keywords, structured_data, img_data, embedding = process_document(
+                    uploaded_file, models, blur_size, block_size, C_value, dilation_iter
+                )
+                st.session_state.processing_complete = True
+                st.session_state.ocr_ready = True
+                # 결과를 세션에 저장
+                st.session_state.doc_results = {
+                    'doc_type': doc_type,
+                    'content': content,
+                    'summary': summary,
+                    'keywords': keywords,
+                    'structured_data': structured_data,
+                    'img_data': img_data,
+                    'embedding': embedding
+                }
+        
+    prev_results = st.session_state.get("prev_doc_results")
     
     # 처리 완료된 결과 표시
     if uploaded_file is not None and st.session_state.doc_results is not None:
         results = st.session_state.doc_results
+        
+
+        st.subheader("📄 현재 분석된 문서 결과")
         
         col1, col2 = st.columns(2)
         with col1:
@@ -709,6 +745,35 @@ with tab1:
                 st.session_state.processed_file = None
                 st.session_state.processing_complete = False
                 st.session_state.doc_results = None
+
+    # 이전 결과가 있다면 비교하기
+    if prev_results:
+        st.markdown("---")
+        st.subheader("🔁 이전 분석 결과와 비교")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.write("📄 **이전 요약**")
+            st.write(prev_results["summary"])
+            st.write("🔑 **이전 키워드**")
+            st.write(prev_results["keywords"])
+
+            if prev_results.get("structured_data"):
+                st.write("📋 **이전 추출 정보**")
+                for key, value in prev_results["structured_data"].items():
+                    st.write(f"- {key}: {value}")
+
+        with col2:
+            st.write("📄 **현재 요약**")
+            st.write(results["summary"])
+            st.write("🔑 **현재 키워드**")
+            st.write(results["keywords"])
+
+            if results.get("structured_data"):
+                st.write("📋 **현재 추출 정보**")
+                for key, value in results["structured_data"].items():
+                    st.write(f"- {key}: {value}")
 
 # 문서 검색 탭
 with tab2:
