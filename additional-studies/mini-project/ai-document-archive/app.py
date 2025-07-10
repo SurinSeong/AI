@@ -10,6 +10,7 @@ from paddleocr import PaddleOCR
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 from datetime import datetime
 from PIL import Image
+import cv2
 import io
 import base64
 import numpy as np
@@ -92,9 +93,69 @@ def extract_receipt_info(image, processor, model):
     except:
         return {}
 
-# 일반 OCR
-def extract_text_with_layout(image, ocr):
+
+# 그레이 스케일 변환하기
+def convert_to_grayscale(image):
+    img_np = np.array(image)  # Pillow → numpy
+    gray_image = cv2.cvtColor(img_np, cv2.COLOR_BGR2GRAY)
+    return gray_image
+
+# 노이즈 제거하기
+def remove_noise(gray_image):
+    # 가우시안 블러 사용
+    denoised = cv2.GaussianBlur(gray_image, (5, 5), 0)
+    return denoised
+
+# 대비 개선하기
+def improve_contrast(denoised):
+    enhanced = cv2.equalizeHist(denoised)
+    return enhanced
+
+# 이진화
+def apply_adaptive_binarization(enhanced):
+    binary = cv2.adaptiveThreshold(
+        enhanced, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2. THRESH_BINARY,
+        11, 2
+    )
+    return binary
+
+# 텍스트 영역 강화
+def enhance_text_regions(binary):
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    final_image = cv2.dilate(binary, kernel, iterations=1)
+    return final_image
+
+# OCR 성능 향상을 위한 이미지 전처리
+def preprocess_image_for_ocr(image):
+    """OCR 성능 향상을 위한 이미지 전처리"""
+    # 1. 그레이 스케일 변화
+    gray_image = convert_to_grayscale(image)
+
+    # 2. 노이즈 제거
+    denoised = remove_noise(gray_image)
+
+    # 3. 대비 개선
+    enhanced = improve_contrast(denoised)
+
+    # 4. 이진화 (텍스트와 배경 분리)
+    binary = apply_adaptive_binarization(enhanced)
+
+    # 5. 텍스트 영역 강화
+    final_image = enhance_text_regions(binary)
+
+    return final_image
+
+
+# OCR 수행
+def perform_ocr(image):
     result = PaddleOCR(lang='korean').ocr(np.array(image))
+    return result
+
+
+# 텍스트와 위치 정보 추출
+def extract_text_and_positions(result):
     text = ""
     boxes = []
     
@@ -102,8 +163,24 @@ def extract_text_with_layout(image, ocr):
         for line in result[0]:
             text += line[1][0] + " "
             boxes.append(line[0])
-    
+
     return text.strip(), boxes
+    
+
+# 기존 OCR 함수에 전처리 옵션 추가하기
+def extract_text_with_layout(image, use_preprocessing=True):
+    """전처리 옵션이 추가된 OCR 함수"""
+    # 전처리 적용 여부 확인하기
+    if use_preprocessing:
+        image = preprocess_image_for_ocr(image)
+
+    # OCR 수행하기
+    result = perform_ocr(image)
+
+    # 텍스트와 위치 정보 추출하기
+    text, boxes = extract_text_and_positions(result)
+    
+    return text, boxes
 
 
 # LayoutLMv3를 활용한 구조화된 정보 추출 함수
