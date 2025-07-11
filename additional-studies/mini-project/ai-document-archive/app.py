@@ -6,11 +6,12 @@ from transformers import (
     AutoTokenizer, AutoModelForSeq2SeqLM,
     VisionEncoderDecoderModel, LayoutLMv3Processor, LayoutLMv3ForTokenClassification,
 )
-from konlpy.tag import Okt, Komoran
+from konlpy.tag import Komoran
 from paddleocr import PaddleOCR
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 from datetime import datetime
 from PIL import Image
+import piexif
 import cv2
 import io
 import base64
@@ -18,7 +19,11 @@ import numpy as np
 from typing import Optional
 import json
 import re
+from datetime import datetime
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import TfidfVectorizer
+from collections import Counter
+from geopy.geocoders import Nominatim
 
 # 데이터베이스 모델
 class Document(SQLModel, table=True):
@@ -69,6 +74,23 @@ def load_models():
             layout_processor, layout_model, summarizer_tokenizer, summarizer_model,
             embedding_model)
 
+# 모델 로드
+@st.cache_resource
+def load_yolo_model():
+    # Yolo 모델 구성 파일과 가중치 파일 경로
+    config_path = "yolov3.cfg"
+    weights_path = "yolov3.weights"
+    names_path = "coco.names"  # 클래스 이름 파일
+
+    # 모델 로드
+    net = cv2.dnn.readNet(weights_path, config_path)
+
+    # 클래스 이름들 로드
+    with open(names_path, 'r') as f:
+        classes = f.read().strip().split("\n")
+    
+    return net, classes
+
 # 문서 유형 분류
 def classify_document(image, dit_processor, dit_model):
     inputs = dit_processor(images=image, return_tensors="pt")
@@ -77,8 +99,13 @@ def classify_document(image, dit_processor, dit_model):
     predicted_class = dit_model.config.id2label[predicted_class_idx]
     
     # 영수증 관련 클래스 매핑
-    if any(keyword in predicted_class.lower() for keyword in ['invoice']):
+    if any(keyword in predicted_class.lower() for keyword in ['invoice', 'receipt']):
         return "영수증"
+    
+    # 문서 관련 클래스가 아니면 "일반 사진"으로 반환
+    if any(keyword in predicted_class.lower() for keyword in ['image', 'photo', 'landscape', 'nature']):
+        return "일반 사진"
+    
     return predicted_class
 
 # 영수증 OCR (Donut)
@@ -98,9 +125,8 @@ def extract_receipt_info(image, processor, model):
 
 
 # 그레이 스케일 변환하기
-def convert_to_grayscale(image):
-    img_np = np.array(image)  # Pillow → numpy
-    gray_image = cv2.cvtColor(img_np, cv2.COLOR_BGR2GRAY)
+def convert_to_grayscale(img_cv):
+    gray_image = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
     return gray_image
 
 # 노이즈 제거하기
@@ -143,19 +169,32 @@ def enhance_text_regions(binary, dilation_iter):
 
 
 # OCR 성능 향상을 위한 이미지 전처리
-def preprocess_image_for_ocr(image, blur_size, block_size, C_value, dilation_iter):
+def preprocess_image_for_ocr(image, blur_size, block_size, C_value, dilation_iter, to_grayscale):
     """OCR 성능 향상을 위한 이미지 전처리"""
+    # PIL을 openCV로 변환
+    img_np = np.array(image)  # Pillow → numpy
+    img_cv = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+
     # 1. 그레이 스케일 변화
-    gray_image = convert_to_grayscale(image)
+    if to_grayscale:
+        gray_image = convert_to_grayscale(img_cv)
+    else:
+        gray_image = img_cv
 
     # 2. 노이즈 제거
     denoised = remove_noise(gray_image, blur_size)
 
     # 3. 대비 개선
-    enhanced = improve_contrast(denoised)
+    if to_grayscale:
+        enhanced = improve_contrast(denoised)
+    else:
+        enhanced = denoised
 
     # 4. 이진화 (텍스트와 배경 분리)
-    binary = apply_adaptive_binarization(enhanced, block_size, C_value)
+    if to_grayscale:
+        binary = apply_adaptive_binarization(enhanced, block_size, C_value)
+    else:
+        binary = enhanced
 
     # 5. 텍스트 영역 강화
     final_image = enhance_text_regions(binary, dilation_iter)
@@ -164,8 +203,8 @@ def preprocess_image_for_ocr(image, blur_size, block_size, C_value, dilation_ite
 
 
 # OCR 수행
-def perform_ocr(image):
-    result = PaddleOCR(lang='korean').ocr(np.array(image))
+def perform_ocr(image, ocr):
+    result = ocr.ocr(np.array(image))
     return result
 
 
@@ -183,14 +222,14 @@ def extract_text_and_positions(result):
     
 
 # 기존 OCR 함수에 전처리 옵션 추가하기
-def extract_text_with_layout(image, blur_size, block_size, C_value, dilation_iter, use_preprocessing=True):
+def extract_text_with_layout(ocr, image, blur_size, block_size, C_value, dilation_iter, to_grayscale, use_preprocessing=True):
     """전처리 옵션이 추가된 OCR 함수"""
     # 전처리 적용 여부 확인하기
     if use_preprocessing:
-        image = preprocess_image_for_ocr(image, blur_size, block_size, C_value, dilation_iter)
+        image = preprocess_image_for_ocr(image, blur_size, block_size, C_value, dilation_iter, to_grayscale)
 
     # OCR 수행하기
-    result = perform_ocr(image)
+    result = perform_ocr(image, ocr)
 
     # 텍스트와 위치 정보 추출하기
     text, boxes = extract_text_and_positions(result)
@@ -562,10 +601,45 @@ def create_compound_nouns(pos_tagged):
 
     return compound_nouns
 
-# TF-IDF 점수 계산하기
-def calculate_tfidf_scores(filtered_nouns):
+# TF-IDF 점수를 통한 키워드 중요도 계산하기
+def calculate_tfidf_scores(current_nouns, type_grouped_nouns, threshold=3):
+    """
+    current_nouns: 현재 문서의 명사 리스트
+    type_grouped_nouns: 동일 유형의 전체 문서들의 명사 리스트
+    threshold: TF-IDF를 적용할 최소 문서의 수
+    """
+    if len(type_grouped_nouns) >= threshold:
+        # TF-IDF 적용하기
+        all_docs = type_grouped_nouns + [current_nouns]
+        docs = [' '.join(doc) for doc in all_docs]
+
+        vectorizer = TfidfVectorizer()
+        tfidf_matrix = vectorizer.fit_transform(docs)
+
+        feature_names = vectorizer.get_feature_names_out()
+        scores = tfidf_matrix.toarray()[-1]    # 마지막이 현재의 문서이기 때문에
+
+        word_scores = dict(zip(feature_names, scores))
+        method = "tfidf"
+
+    else:
+        # 단어 빈도 적용
+        word_scores = dict(Counter(current_nouns))
+        method = "term-frequency"
     
-    return word_scores
+    return word_scores, method
+
+# 점수 기준 상위 키워드 선택
+def select_top_keywords(word_scores, top_k):
+    # 점수 기준 내림차순으로 정렬
+    sorted_keywords = sorted(word_scores.items(), key=lambda x:x[1], reverse=True)
+
+    # 상위 top_k만 선택하기
+    top_keywords = []
+    for word, score in sorted_keywords[:top_k]:
+        top_keywords.append(word)
+    
+    return top_keywords
 
 # 형태소 분석을 통한 키워드 추출
 def extract_keywords_with_morpheme_analysis(text, top_k=15):
@@ -586,32 +660,273 @@ def extract_keywords_with_morpheme_analysis(text, top_k=15):
     filtered_nouns.extend(compound_nouns)
 
     # 4. TF-IDF 점수 계산
-    word_scores = calculate_tfidf_scores(filtered_nouns)
+    # 우선 같은 유형의 문서가 없다고 가정한다.
+    word_scores, method = calculate_tfidf_scores(filtered_nouns, [])
 
     # 5. 점수 기준 상위 키워드 선택
     top_keywords = select_top_keywords(word_scores, top_k)
 
-    return top_keywords
+    return top_keywords, method
+
+# 구조화된 데이터(ex. 영수증)에서 키워드 추출하기 함수
+def extract_structured_keywords(structured_data):
+    structured_data_keywords = []
+
+    if 'store' in structured_data:
+        structured_data_keywords.append(structured_data['store'])
+    if 'date' in structured_data:
+        structured_data_keywords.append(structured_data['date'])
+
+    return structured_data_keywords
 
 # 기존 함수 대체하기
 def extract_keywords(text, structured_data=None):
     """개선된 키워드 추출 함수"""
     # 형태소 분석 기반 키워드 추출
-    keywords = extract_keywords_with_morpheme_analysis(text)
+    keywords, method = extract_keywords_with_morpheme_analysis(text)
     
     # 구조화된 데이터에서 추가 키워드
     if structured_data:
         keywords.extend(extract_structured_keywords(structured_data))
-
-        if 'store' in structured_data:
-            keywords.append(structured_data['store'])
-        if 'date' in structured_data:
-            keywords.append(structured_data['date'])
     
     return ", ".join(list(set(keywords)))
 
+#---------------------------------------------------------------------------
+# 사진 구분 및 메타데이터 검색
+# EXIF 데이터 읽기
+def read_exif_data(image):
+    # EXIF 데이터 추출
+    exif_info = piexif.load(image.info["exif"])
+
+    return exif_info
+
+# 주요 정보 추출하기
+def extract_key_info(exif_info):
+    metadata = {}
+
+    # 촬영 일자
+    date_time = exif_info.get("0th", {}).get(piexif.ImageIFD.DateTime, None)
+    if date_time:
+        metadata["date_time"] = date_time.decode("utf-8")
+
+    # 카메라 제조사
+    make = exif_info.get("0th", {}).get(piexif.ImageIFD.Make, None)
+    if make:
+        metadata["make"] = make.decode("utf-8")
+
+    # 카메라 모델
+    model = exif_info.get("0th", {}).get(piexif.ImageIFD.Model, None)
+    if model:
+        metadata["model"] = model.decode("utf-8")
+
+    # GPS 좌표 (위도/경도)
+    # 4. GPS 좌표 (위도/경도)
+    gps_info = exif_info.get("GPS", {})
+    latitude = gps_info.get(piexif.GPSIFD.GPSLatitude, None)
+    longitude = gps_info.get(piexif.GPSIFD.GPSLongitude, None)
+
+    if latitude and longitude:
+        # 위도/경도 계산
+        lat_degree = latitude[0][0] / latitude[0][1]
+        lat_minute = latitude[1][0] / latitude[1][1]
+        lat_second = latitude[2][0] / latitude[2][1]
+        latitude_in_deg = lat_degree + (lat_minute / 60.0) + (lat_second / 3600.0)
+
+        lon_degree = longitude[0][0] / longitude[0][1]
+        lon_minute = longitude[1][0] / longitude[1][1]
+        lon_second = longitude[2][0] / longitude[2][1]
+        longitude_in_deg = lon_degree + (lon_minute / 60.0) + (lon_second / 3600.0)
+
+        metadata["latitude"] = latitude_in_deg
+        metadata["longitude"] = longitude_in_deg
+
+    return metadata
+
+# 사진에서 메타데이터 추출
+def extract_photo_metadata(image):
+    """사진에서 메타데이터 추출"""
+    # 1. EXIF 데이터 읽기
+    exif_info = read_exif_data(image)
+
+    # 2. 주요 정보 추출 (날짜, 카메라, GPS)
+    metadata = extract_key_info(exif_info)
+
+    return metadata
+
+# 객체 탐지 실행 함수
+def run_object_detection_model(image):
+    # 이미지 준비하기
+    blob = cv2.dnn.blobFromImage(image, 0.00392, (416, 416), (0, 0, 0), True, crop=False)
+    net.setInput(blob)
+
+    # 출력 레이어
+    output_layers = net.getUnconnectedOutLayersNames()
+    layer_outputs = net.forward(output_layers)
+
+    # 객체 탐지 결과
+    detected_objects = []
+    height, width, channels = image.shape
+    for output in layer_outputs:
+        for detection in output:
+            scores = detection[5:]
+            class_id = np.argmax(scores)
+            confidence = scores[class_id]
+            if confidence > 0.5:    # 신뢰도가 50%일 때만 탐지하기
+                center_x = int(detection[0] * width)
+                center_y = int(detection[1] * height)
+                w = int(detection[2] * width)
+                h = int(detection[3] * height)
+
+                # 바운딩 박스 좌표
+                x = center_x - w // 2
+                y = center_y - h // 2
+
+                detected_objects.append({
+                    "class": classes[class_id],
+                    "confidence": confidence,
+                    "box": [x, y, w, h]
+                })
+
+    return detected_objects
+
+# 사진 안의 객체 탐지하기
+def detect_photo_objects(image):
+    """사진 내의 객체 탐지"""
+    detected_objects = run_object_detection_model(image)
+
+    # 디버깅
+    for obj in detected_objects:
+        print(f"Detected {obj['class']} with confidence {obj['confidence']:.2f}")
+
+    return detected_objects
+
+# 날짜 키워드 추가하기
+def create_date_keywords(taken_data):
+    # 촬영 일자 파싱
+    try:
+        date_obj = datetime.strptime(taken_data, "%Y:%m:%d %H:%M:%S")
+
+        # 연도, 월, 일, 시간대 추출
+        year = str(date_obj.year)
+        month = str(date_obj.month).zfill(2)  # 09처럼 두 자릿수로 표시
+        day = str(date_obj.day).zfill(2)
+        hour = date_obj.hour
+
+        # 시간대 추출(오전/오후)
+        time_of_day = "AM" if hour < 12 else "PM"
+
+        # 키워드 리스트 반환
+        date_keywords = [year, month, day, time_of_day]
+        return date_keywords
+    
+    except Exception as e:
+        print(f"Error parsing date: {e}")
+        return []
+    
+# 위치 정보 주소 반환
+def reverse_geocoding(location):
+    """
+    location: (latitude, longtitude) 튜플 형태의 좌표
+    예: (37.7749, -122.4194)
+    """
+
+    geolocator = Nominatim(user_agent="geoapiExercises")
+
+    # Reverse Geocoding (위도, 경도를 주소로 변환)
+    location_info = geolocator.reverse(location, language="ko")
+
+    if location_info:
+        return location_info.address
+    else:
+        return None
+
+# 사진 키워드 생성하기
+def generate_photo_keywords(metadata, objects):
+    """사진 메타데이터와 객체로 키워드 생성"""
+    keywords = []
+
+    # 날짜 키워드 추가
+    if metadata.get("taken_date"):
+        keywords.extend(create_date_keywords(metadata["taken_data"]))
+
+    # 카메라 정보 추가
+    if metadata.get("camera_info"):
+        keywords.append(metadata["camera_info"])
+
+    # 탐지된 객체 추가
+    keywords.extend(objects)
+
+    # 위치 정보를 주소로 변환
+    if metadata.get("location"):
+        address = reverse_geocoding(metadata["location"])
+        if address:
+            keywords.append(address)
+
+    return keywords
+
+# 일반 사진인지 확인
+def is_photo(doc_type, content):
+    """
+    문서 사진과 일반 사진을 구분하는 함수
+    image: 이미지 파일
+    doc_type: 문서 타입
+    content: 문서 내용
+    """
+    if doc_type == "image" or len(content.strip()) == 0:
+        return True
+    else:
+        return False
+
+# 구조화된 데이터 생성하기
+def format_photo_data(metadata, objects):
+    """
+    구조화된 데이터 생성: 메타데이터와 객체 탐지 결과를 합친다.
+    metadata: 사진의 메타데이터(EXIF 데이터 등)
+    objects: 객체 탐지 결과 (예: 사람, 자동차 등)
+    """
+    # 기본 메타 데이터
+    photo_data = {
+        "date_time": metadata.get("taken_data", ""),
+        "make": metadata.get("make", ""),
+        "model": metadata.get("model", ""),
+        "latitude": metadata.get("latitude", None),
+        "longtitude": metadata.get("longitude", None),
+        "objects_detected": objects  # 탐지된 객체들
+    }
+
+    return photo_data
+
+# 사진 요약 생성
+def create_photo_summary(objects, metadata):
+    """
+    사진 요약 생성: 객체 탐지 결과와 메타데이터를 사용해서 요약을 생성
+    objects: 탐지된 객체들 (예: 사람, 자동차 등)
+    metadata: 사진의 메타데이터
+    """
+    # 날짜, 카메라 정보 추출
+    date_time = metadata.get("taken_data", "Unknown date")
+    camera_make = metadata.get("make", "Unknown camera")
+    camera_model = metadata.get("model", "Unknown model")
+    latitude = metadata.get("latitude", "Unknown latitude")
+    longitude = metadata.get("longitude", "Unknown longitude")
+
+    # 객체 정보 생성
+    object_info = []
+    for obj in objects:
+        object_info.append(f"{obj['class']} (confidence: {obj['confidence']:.2f})")
+    
+    # 요약 문장 생성
+    summary = (
+        f"This photo was taken on {date_time} by a {camera_make} {camera_model}. "
+        f"The photo includes: {', '.join(object_info)}. "
+        f"The photo was taken at latitude {latitude} and longitude {longitude}."
+    )
+    
+    return summary
+
+#------------------------------------------------------------
 # 문서 처리
-def process_document(uploaded_file, models, blur_size, block_size, C_value, dilation_iter):
+def process_document(uploaded_file, models, blur_size, block_size, C_value, dilation_iter, to_grayscale):
     (dit_processor, dit_model, ocr, donut_processor, donut_model, 
      layout_processor, layout_model, sum_tokenizer, sum_model,
      embedding_model) = models
@@ -620,12 +935,39 @@ def process_document(uploaded_file, models, blur_size, block_size, C_value, dila
     
     # 1. 문서 유형 분류
     doc_type = classify_document(image, dit_processor, dit_model)
+    
     print('\n==========')
     print(f'\n[doc_type]\n{doc_type}')
-    content, boxes = extract_text_with_layout(image, blur_size, block_size, C_value, dilation_iter)
+    
+    content, boxes = extract_text_with_layout(image, ocr, blur_size, block_size, C_value, dilation_iter, to_grayscale)
     layoutlm_data = extract_structured_with_layoutlm(image, content, boxes, layout_processor, layout_model, doc_type)
+    
     print('\n==========')
     print(f'\n[layoutlm_data]\n{layoutlm_data}')
+    
+    # 이거 어디에 들어가야 하는지 생각하기
+    # 사진 여부 판별하기
+    if is_photo(doc_type, content):
+        # 메타데이터 추출
+        metadata = extract_photo_metadata(image)
+        
+        # 객체 탐지
+        objects = detect_photo_objects(image)
+
+        # 키워드 생성
+        keywords = generate_photo_keywords(metadata, objects)
+
+        # 구조화된 데이터로 저장
+        structured_data = format_photo_data(metadata, objects)
+
+        # 요약 생성
+        summary = create_photo_summary(objects, metadata)
+
+        # 임베딩 생성
+        embedding = create_embedding(summary, embedding_model)
+
+        return doc_type, content, summary, keywords, structured_data, img_data, embedding
+
     # 2. 문서 유형별 처리
     if doc_type == "영수증":
         print('영수증')
@@ -653,6 +995,9 @@ def process_document(uploaded_file, models, blur_size, block_size, C_value, dila
     print('\n==========')
     print(f'\n[structured_data]\n{structured_data}')
     
+    
+        
+        
     # 3. 요약 생성
     summary = summarize_text(content, sum_tokenizer, sum_model)
 
@@ -671,7 +1016,7 @@ def process_document(uploaded_file, models, blur_size, block_size, C_value, dila
     img_byte_arr = io.BytesIO()
     image.save(img_byte_arr, format='PNG')
     img_data = img_byte_arr.getvalue()
-    
+
     return doc_type, content, summary, keywords, structured_data, img_data, embedding
 
 # 벡터 유사도 검색
@@ -718,12 +1063,14 @@ def print_result_list(results):
                 href = f'<a href="data:image/png;base64,{b64}" download="{doc.filename}">다운로드</a>'
                 st.markdown(href, unsafe_allow_html=True)
 
+#-------------------------------------------------------------------------------------------------
 # Streamlit UI
 st.title("AI 아카이브 시스템")
 
 # 모델 로드
 with st.spinner("AI 모델 로딩 중..."):
     models = load_models()
+    net, classes = load_yolo_model()
 
 # 탭 생성
 tab1, tab2, tab3 = st.tabs(["문서 업로드", "문서 검색", "문서 목록"])
@@ -753,6 +1100,7 @@ with tab1:
     if uploaded_file:
         st.subheader("🔧 전처리 설정")
 
+        grayscale_option = st.checkbox("흑백(Grayscale) 처리", value=True)
         blur_size = st.slider("가우시안 블러 커널 크기", 1, 11, 5, step=2)
         block_size = st.slider("Adaptive Threshold blockSize", 3, 25, 11, step=2)
         C_value = st.slider("Threshold 상수 C", 0, 10, 2)
@@ -760,14 +1108,19 @@ with tab1:
 
         # 전처리 미리보기
         pil_image = Image.open(uploaded_file).convert("RGB")
-        final_image = preprocess_image_for_ocr(pil_image, blur_size, block_size, C_value, dilation_iter)
+        final_image = preprocess_image_for_ocr(pil_image, blur_size, block_size, C_value, dilation_iter, grayscale_option)
 
-        st.image(final_image, caption="전처리 결과", channels="GRAY")
-
+        if grayscale_option:
+            channel_name = "GRAY"
+        else:
+            channel_name = "COLOR"
+        
+        st.image(final_image, caption="전처리 결과", channels=channel_name)
+        
         if st.button("🔠 OCR 시작"):
             with st.spinner("OCR 분석 중..."):
                 doc_type, content, summary, keywords, structured_data, img_data, embedding = process_document(
-                    uploaded_file, models, blur_size, block_size, C_value, dilation_iter
+                    uploaded_file, models, blur_size, block_size, C_value, dilation_iter, grayscale_option
                 )
                 st.session_state.processing_complete = True
                 st.session_state.ocr_ready = True
