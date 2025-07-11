@@ -1,0 +1,54 @@
+{
+  "id": null,
+  "uid": "ai-monitoring",
+  "title": "AI 서비스 모니터링",
+  "timezone": "browser",
+  "schemaVersion": 30,
+  "version": 1,
+  "panels": [
+    {
+      "type": "stat",
+      "title": "추론 요청 처리량",
+      "targets": [
+        {
+          "expr": "sum(rate(model_predictions_total[5m]))",
+          "legendFormat": "요청/초"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 0, "w": 8, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "학습 지연 시간",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, rate(model_training_latency_seconds[5m]))",
+          "legendFormat": "95번째 백분위수"
+        }
+      ],
+      "gridPos": { "x": 8, "y": 0, "w": 8, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "GPU 사용률",
+      "targets": [
+        {
+          "expr": "gpu_utilization_percent * 100",
+          "legendFormat": "GPU {{name}}"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 4, "w": 8, "h": 4 }
+    },
+    {
+      "type": "stat",
+      "title": "오류율",
+      "targets": [
+        {
+          "expr": "(sum(rate(model_predictions_total{status=~\"error\"}[5m])) / sum(rate(model_predictions_total[5m]))) * 100",
+          "legendFormat": "오류율 %"
+        }
+      ],
+      "gridPos": { "x": 8, "y": 4, "w": 8, "h": 4 }
+    }
+  ]
+}
