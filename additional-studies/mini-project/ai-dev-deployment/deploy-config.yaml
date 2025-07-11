@@ -1,8 +1,0 @@
-ec2:
-  ip: "YOUR_EC2_PUBLIC_IP"
-  user: "ubuntu"         # Amazon Linux는 "ec2-user"
-  key_path: "/path/to/your-key.pem"
-
-paths:
-  local_project_dir: "./my_project"
-  remote_dir: "/home/ubuntu/my_project"

@@ -1,9 +1,0 @@
-train:
-  learning_rate: 0.001
-  batch_size: 32
-  epochs: 100
-
-data:
-  train_split: 0.8
-  val_split: 0.1
-  test_split: 0.1
